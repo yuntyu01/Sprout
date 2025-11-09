@@ -118,34 +118,60 @@ resource "aws_subnet" "prod_db_c" {
   }
 }
 
-################
-### instance ###
-################
-resource "aws_instance" "prod_was_a" {
-  ami           = "ami-077ad873396d76f6a"
+
+########################
+### ALB, TargetGroup ### 
+########################
+
+resource "aws_launch_template" "prod_was_lt" {
+  name_prefix   = "prod_was_lt"
+  image_id      = "ami-077ad873396d76f6a"
   instance_type = "t2.micro"
-  security_groups = [aws_security_group.prod_was_sg.id]
+  key_name      = "prod_key"
 
-  subnet_id = aws_subnet.prod_was_a.id
-  key_name  = "prod_key"
-
-  tags = {
-    Name = "prod_was_a"
+  # EIP 자동 할당
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.prod_was_sg.id]
   }
-}
-resource "aws_instance" "prod_was_c" {
-  ami           = "ami-077ad873396d76f6a"
-  instance_type = "t3.micro"
-  security_groups = [aws_security_group.prod_was_sg.id]
-
-  subnet_id = aws_subnet.prod_was_c.id
-  key_name  = "prod_key"
 
   tags = {
-    Name = "prod_was_c"
+    Name = "prod_was_lt"
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
+resource "aws_autoscaling_group" "prod_was_asg" {
+  name                = "prod-was-asg"
+  desired_capacity    = 2
+  max_size            = 4
+  min_size            = 2
+  vpc_zone_identifier = [aws_subnet.prod_was_a.id, aws_subnet.prod_was_c.id]
+
+  launch_template {
+    id      = aws_launch_template.prod_was_lt.id
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.prod_was_tg.arn]
+
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
+
+  tag {
+    key                 = "Name"
+    value               = "prod-was-instance"
+    propagate_at_launch = true #ASG가 생성하는 EC2에 tag 붙히기
+  }
+}
+
+
+#######################
+### Security Groups ###
+#######################
 resource "aws_security_group" "prod_was_sg" {
   name        = "prod-was-sg"
   description = "Security group for WAS servers"
@@ -153,22 +179,22 @@ resource "aws_security_group" "prod_was_sg" {
 
   # 인바운드 규칙: ALB에서 오는 HTTP 허용
   ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description     = "Allow HTTP from anywhere"
+    description = "Allow HTTP from anywhere"
   }
 
-    ingress {
-    from_port       = 22
-    to_port         = 22
-    protocol        = "tcp"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description     = "Allow SSH from anywhere"
+    description = "Allow SSH from anywhere"
   }
-  
-  
+
+
 
   # 아웃바운드 규칙: 모든 트래픽 허용
   egress {
@@ -181,6 +207,42 @@ resource "aws_security_group" "prod_was_sg" {
 
   tags = {
     Name = "prod-was-sg"
+  }
+}
+
+resource "aws_security_group" "prod_alb_sg" {
+  name        = "prod-alb-sg"
+  description = "Security group for public ALB"
+  vpc_id      = aws_vpc.prod.id
+
+  # 인바운드 규칙: 외부 HTTP/HTTPS 허용
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP from anywhere"
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS from anywhere"
+  }
+
+  # 아웃바운드 규칙: 모든 트래픽 허용
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name = "prod-alb-sg"
   }
 }
 
@@ -232,49 +294,61 @@ resource "aws_lb_target_group" "prod_was_tg" {
   }
 }
 
-resource "aws_lb_target_group_attachment" "prod_was_a_attach" {
-  target_group_arn = aws_lb_target_group.prod_was_tg.arn
-  target_id        = aws_instance.prod_was_a.id
-  port             = 80
-}
-resource "aws_lb_target_group_attachment" "prod_was_c_attach" {
-  target_group_arn = aws_lb_target_group.prod_was_tg.arn
-  target_id        = aws_instance.prod_was_c.id
-  port             = 80
+########################
+###        RDS       ### 
+########################
+
+resource "aws_db_subnet_group" "prod_db_sg" {
+  name       = "prod-db-subnect-group"
+  subnet_ids = [aws_subnet.prod_db_a.id, aws_subnet.prod_db_c.id]
+  tags = {
+    Name = "Prod DB Subnet Group"
+  }
 }
 
-resource "aws_security_group" "prod_alb_sg" {
-  name        = "prod-alb-sg"
-  description = "Security group for public ALB"
+resource "aws_security_group" "prod_db_sg" {
+  name        = "prod-db-sg"
+  description = "Security group for RDS DB"
   vpc_id      = aws_vpc.prod.id
 
-  # 인바운드 규칙: 외부 HTTP/HTTPS 허용
+  # 인바운드 규칙: WAS SG에서 오는 MySQL(3306) 트래픽만 허용
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP from anywhere"
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.prod_was_sg.id] # WAS SG ID 참조
+    description     = "Allow MySQL from WAS SG"
   }
 
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS from anywhere"
-  }
-
-  # 아웃바운드 규칙: 모든 트래픽 허용
+  # 아웃바운드 규칙 (기본값: 모두 허용)
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
   }
 
   tags = {
-    Name = "prod-alb-sg"
+    Name = "prod-db-sg"
+  }
+}
+
+resource "aws_db_instance" "prod_db" {
+  identifier        = "prod-db-instance"
+  allocated_storage = 20
+  engine            = "mysql"
+  engine_version    = "8.0"
+  instance_class    = "db.t3.micro"
+
+  db_name  = "ccdb"
+  username = "ccuser"
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.prod_db_sg.name
+  vpc_security_group_ids = [aws_security_group.prod_db_sg.id]
+  skip_final_snapshot    = true
+
+  tags = {
+    Name = "prod_db"
   }
 }
